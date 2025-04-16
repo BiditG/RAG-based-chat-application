@@ -149,7 +149,7 @@ with st.sidebar:
         add_to_vector_collection(all_splits, file_key)
 
 st.divider()
-st.subheader("🎓 Step 2: Generate & Review Questions")
+st.subheader("🎓 Generate & Review Questions")
 generate = st.button("🧠 Generate MCQs")
 
 if generate:
