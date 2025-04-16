@@ -1,5 +1,7 @@
 import os
+import re
 import tempfile
+import io
 
 import chromadb
 import ollama
@@ -13,12 +15,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 
+# ---------------------------- PROMPT FOR MCQ GENERATION ----------------------------
 system_prompt = """
 You are an AI assistant that generates multiple choice questions (MCQs) from a given academic or informational text.
 
 Instructions:
 1. Analyze the provided context and extract key information.
-2. Create well-structured MCQs based solely on the content.
+2. Create 15 well-structured MCQs based solely on the content.
 3. Each MCQ should include:
    - A clear question
    - Four options (A–D)
@@ -38,35 +41,34 @@ Question 2:
 ...
 """
 
+# ---------------------------- UTILITIES ----------------------------
+def parse_mcqs(raw_mcq_text):
+    questions = re.findall(r"(Question \d+:\n.*?Answer: [A-D])", raw_mcq_text, re.DOTALL)
+    parsed_mcqs = []
+    for q_block in questions:
+        lines = q_block.strip().split("\n")
+        question_title = lines[0].strip()
+        question_text = lines[1].strip()
+        options = lines[2:6]
+        answer_line = lines[-1].strip()
+        correct_answer = answer_line.split(": ")[1]
+        parsed_mcqs.append({
+            "title": question_title,
+            "question": question_text,
+            "options": options,
+            "answer": correct_answer
+        })
+    return parsed_mcqs
 
 def process_document(uploaded_file: UploadedFile) -> list[Document]:
-    """Processes an uploaded PDF file by converting it to text chunks.
-
-    Takes an uploaded PDF file, saves it temporarily, loads and splits the content
-    into text chunks using recursive character splitting.
-
-    Args:
-        uploaded_file: A Streamlit UploadedFile object containing the PDF file
-
-    Returns:
-        A list of Document objects containing the chunked text from the PDF
-
-    Raises:
-        IOError: If there are issues reading/writing the temporary file
-    """
-    # Save uploaded file temporarily and get its path
     with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as temp_file:
         temp_file.write(uploaded_file.read())
         temp_file_path = temp_file.name
 
-    # Load and process the PDF
     loader = PyMuPDFLoader(temp_file_path)
     docs = loader.load()
-
-    # Remove the temp file after use
     os.unlink(temp_file_path)
 
-    # Split the loaded text into chunks
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=400,
         chunk_overlap=100,
@@ -74,24 +76,11 @@ def process_document(uploaded_file: UploadedFile) -> list[Document]:
     )
     return text_splitter.split_documents(docs)
 
-
-
 def get_vector_collection() -> chromadb.Collection:
-    """Gets or creates a ChromaDB collection for vector storage.
-
-    Creates an Ollama embedding function using the nomic-embed-text model and initializes
-    a persistent ChromaDB client. Returns a collection that can be used to store and
-    query document embeddings.
-
-    Returns:
-        chromadb.Collection: A ChromaDB collection configured with the Ollama embedding
-            function and cosine similarity space.
-    """
     ollama_ef = OllamaEmbeddingFunction(
         url="http://localhost:11434/api/embeddings",
         model_name="nomic-embed-text:latest",
     )
-
     chroma_client = chromadb.PersistentClient(path="./demo-rag-chroma")
     return chroma_client.get_or_create_collection(
         name="rag_app",
@@ -99,160 +88,99 @@ def get_vector_collection() -> chromadb.Collection:
         metadata={"hnsw:space": "cosine"},
     )
 
-
 def add_to_vector_collection(all_splits: list[Document], file_name: str):
-    """Adds document splits to a vector collection for semantic search.
-
-    Takes a list of document splits and adds them to a ChromaDB vector collection
-    along with their metadata and unique IDs based on the filename.
-
-    Args:
-        all_splits: List of Document objects containing text chunks and metadata
-        file_name: String identifier used to generate unique IDs for the chunks
-
-    Returns:
-        None. Displays a success message via Streamlit when complete.
-
-    Raises:
-        ChromaDBError: If there are issues upserting documents to the collection
-    """
     collection = get_vector_collection()
     documents, metadatas, ids = [], [], []
-
     for idx, split in enumerate(all_splits):
         documents.append(split.page_content)
         metadatas.append(split.metadata)
         ids.append(f"{file_name}_{idx}")
-
-    collection.upsert(
-        documents=documents,
-        metadatas=metadatas,
-        ids=ids,
-    )
-    st.success("Data added to the vector store!")
-
+    collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+    st.toast("✅ Document embedded and stored in vector DB!", icon="📦")
 
 def query_collection(prompt: str, n_results: int = 10):
-    """Queries the vector collection with a given prompt to retrieve relevant documents.
-
-    Args:
-        prompt: The search query text to find relevant documents.
-        n_results: Maximum number of results to return. Defaults to 10.
-
-    Returns:
-        dict: Query results containing documents, distances and metadata from the collection.
-
-    Raises:
-        ChromaDBError: If there are issues querying the collection.
-    """
     collection = get_vector_collection()
     results = collection.query(query_texts=[prompt], n_results=n_results)
     return results
 
-
 def call_llm(context: str, prompt: str):
-    """Calls the language model with context and prompt to generate a response.
-
-    Uses Ollama to stream responses from a language model by providing context and a
-    question prompt. The model uses a system prompt to format and ground its responses appropriately.
-
-    Args:
-        context: String containing the relevant context for answering the question
-        prompt: String containing the user's question
-
-    Yields:
-        String chunks of the generated response as they become available from the model
-
-    Raises:
-        OllamaError: If there are issues communicating with the Ollama API
-    """
     response = ollama.chat(
         model="llama3.2:3b",
         stream=True,
         messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": f"Context: {context}, Question: {prompt}",
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context: {context}, Question: {prompt}"},
         ],
     )
     for chunk in response:
-        if chunk["done"] is False:
+        if not chunk["done"]:
             yield chunk["message"]["content"]
         else:
             break
 
-
 def re_rank_cross_encoders(documents: list[str]) -> tuple[str, list[int]]:
-    """Re-ranks documents using a cross-encoder model for more accurate relevance scoring.
-
-    Uses the MS MARCO MiniLM cross-encoder model to re-rank the input documents based on
-    their relevance to the query prompt. Returns the concatenated text of the top 3 most
-    relevant documents along with their indices.
-
-    Args:
-        documents: List of document strings to be re-ranked.
-
-    Returns:
-        tuple: A tuple containing:
-            - relevant_text (str): Concatenated text from the top 3 ranked documents
-            - relevant_text_ids (list[int]): List of indices for the top ranked documents
-
-    Raises:
-        ValueError: If documents list is empty
-        RuntimeError: If cross-encoder model fails to load or rank documents
-    """
     relevant_text = ""
     relevant_text_ids = []
-
     encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    ranks = encoder_model.rank(prompt, documents, top_k=3)
+    ranks = encoder_model.rank("generate MCQs", documents, top_k=3)
     for rank in ranks:
         relevant_text += documents[rank["corpus_id"]]
         relevant_text_ids.append(rank["corpus_id"])
-
     return relevant_text, relevant_text_ids
 
+# ---------------------------- STREAMLIT UI ----------------------------
+st.set_page_config(page_title="🧠 Smart MCQ Generator", layout="wide")
+st.title("📘 Intelligent MCQ Generator from PDF")
+st.caption("Upload your PDF and generate interactive multiple choice questions using AI")
 
-if __name__ == "__main__":
-    # Document Upload Area
-    with st.sidebar:
-        st.set_page_config(page_title="RAG Question Answer")
-        uploaded_file = st.file_uploader(
-            "**📑 Upload PDF files for QnA**", type=["pdf"], accept_multiple_files=False
-        )
+if "mcqs" not in st.session_state:
+    st.session_state.mcqs = []
+    st.session_state.response_text = ""
 
-        process = st.button(
-            "⚡️ Process",
-        )
-        if uploaded_file and process:
-            normalize_uploaded_file_name = uploaded_file.name.translate(
-                str.maketrans({"-": "_", ".": "_", " ": "_"})
-            )
-            all_splits = process_document(uploaded_file)
-            add_to_vector_collection(all_splits, normalize_uploaded_file_name)
+with st.sidebar:
+    st.subheader("📂 Upload Document")
+    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+    process = st.button("⚡ Process PDF")
+    if uploaded_file and process:
+        file_key = uploaded_file.name.translate(str.maketrans({"-": "_", ".": "_", " ": "_"}))
+        all_splits = process_document(uploaded_file)
+        add_to_vector_collection(all_splits, file_key)
 
-    # Question and Answer Area
-    st.header("🗣️ RAG Question Answer")
-    prompt = st.text_area("**Ask a question related to your document:**")
-    ask = st.button(
-        "🔥 Ask",
-    )
+st.divider()
+st.subheader("🎓 Step 2: Generate & Review Questions")
+generate = st.button("🧠 Generate MCQs")
 
-    if ask and prompt:
-        results = query_collection(prompt)
-        context = results.get("documents")[0]
-        relevant_text, relevant_text_ids = re_rank_cross_encoders(context)
-        response = call_llm(context=relevant_text, prompt=prompt)
-        st.write_stream(response)
+if generate:
+    results = query_collection("generate MCQs")
+    context = results.get("documents")[0]
+    relevant_text, _ = re_rank_cross_encoders(context)
 
-        with st.expander("See retrieved documents"):
-            st.write(results)
+    with st.spinner("Generating MCQs using AI..."):
+        st.session_state.response_text = ""
+        for chunk in call_llm(context=relevant_text, prompt="Generate 15 multiple choice questions"):
+            st.session_state.response_text += chunk
 
-        with st.expander("See most relevant document ids"):
-            st.write(relevant_text_ids)
-            st.write(relevant_text)
+    st.session_state.mcqs = parse_mcqs(st.session_state.response_text)
+    st.success("✅ MCQs generated successfully!")
+
+if st.session_state.mcqs:
+    st.markdown("### 📖 Review Your Questions")
+    score = 0
+    for i, mcq in enumerate(st.session_state.mcqs):
+        with st.expander(f"{mcq['title']}: {mcq['question']}"):
+            user_choice = st.radio("Choose the correct answer:", mcq["options"], key=f"q{i}")
+            if st.button("Check Answer", key=f"check{i}"):
+                if user_choice:
+                    if user_choice.startswith(mcq["answer"]):
+                        st.success("✅ Correct!")
+                        score += 1
+                    else:
+                        st.error(f"❌ Incorrect. Correct answer is: {mcq['answer']}")
+                else:
+                    st.warning("⚠️ Please select an option before checking.")
+
+    st.markdown(f"### 🏁 Final Score: {score} / {len(st.session_state.mcqs)}")
+    st.download_button("💾 Download All MCQs", data=st.session_state.response_text, file_name="mcqs.txt")
+
+    with st.expander("📂 See Retrieved Context Chunks"):
+        st.write(st.session_state.response_text)
