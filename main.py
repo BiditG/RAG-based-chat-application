@@ -136,6 +136,8 @@ st.caption("Upload your PDF and generate interactive multiple choice questions u
 if "mcqs" not in st.session_state:
     st.session_state.mcqs = []
     st.session_state.response_text = ""
+    st.session_state.answers_checked = {}
+    st.session_state.selections = {}
 
 with st.sidebar:
     st.subheader("📂 Upload Document")
@@ -161,6 +163,8 @@ if generate:
             st.session_state.response_text += chunk
 
     st.session_state.mcqs = parse_mcqs(st.session_state.response_text)
+    st.session_state.answers_checked = {}
+    st.session_state.selections = {}
     st.success("✅ MCQs generated successfully!")
 
 if st.session_state.mcqs:
@@ -168,8 +172,16 @@ if st.session_state.mcqs:
     score = 0
     for i, mcq in enumerate(st.session_state.mcqs):
         with st.expander(f"{mcq['title']}: {mcq['question']}"):
-            user_choice = st.radio("Choose the correct answer:", mcq["options"], key=f"q{i}")
-            if st.button("Check Answer", key=f"check{i}"):
+            selection_key = f"q{i}_selection"
+            check_key = f"check{i}"
+            st.session_state.selections[selection_key] = st.radio(
+                "Choose the correct answer:", mcq["options"], key=selection_key
+            )
+            if st.button("Check Answer", key=check_key):
+                st.session_state.answers_checked[check_key] = True
+
+            if st.session_state.answers_checked.get(check_key):
+                user_choice = st.session_state.selections.get(selection_key)
                 if user_choice:
                     if user_choice.startswith(mcq["answer"]):
                         st.success("✅ Correct!")
